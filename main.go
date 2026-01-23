@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"os/exec"
 )
 
 // Ref represents a reference to an image
@@ -185,19 +186,90 @@ func (gt *GoTree) Mount(refName, mountPoint string) error {
 
 // Unmount unmounts a ref from a folder
 func (gt *GoTree) Unmount(mountPoint string) error {
+	return gt.unmountWithOptions(mountPoint, false)
+}
+
+// UnmountForce forcibly unmounts a ref, killing processes if needed
+func (gt *GoTree) UnmountForce(mountPoint string) error {
+	return gt.unmountWithOptions(mountPoint, true)
+}
+
+func (gt *GoTree) unmountWithOptions(mountPoint string, force bool) error {
 	if !gt.isMounted(mountPoint) {
 		return fmt.Errorf("mount point not mounted")
 	}
-
-	if err := syscall.Unmount(mountPoint, 0); err != nil {
-		return fmt.Errorf("failed to unmount: %w", err)
+	
+	absPath, err := filepath.Abs(mountPoint)
+	if err != nil {
+		absPath = mountPoint
 	}
+	
+	// Sync filesystem to ensure all writes are flushed
+	syscall.Sync()
+	
+	// Try unmount with retry logic
+	var lastErr error
+	maxRetries := 3
+	if force {
+		maxRetries = 5
+	}
+	
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			syscall.Sync()
+		}
+		
+		// On force mode and after first failure, try to kill processes
+		if force && i > 0 {
+			gt.killProcessesUsingMount(absPath)
+			time.Sleep(200 * time.Millisecond)
+		}
+		
+		err := syscall.Unmount(mountPoint, 0)
+		if err == nil {
+			// Remove mount info
+			mountFile := filepath.Join(gt.repoPath, "mounts", filepath.Base(mountPoint)+".json")
+			os.Remove(mountFile)
+			return nil
+		}
+		
+		lastErr = err
+		
+		// If still busy, try lazy unmount on last attempt
+		if i == maxRetries-1 {
+			err = syscall.Unmount(mountPoint, syscall.MNT_DETACH)
+			if err == nil {
+				mountFile := filepath.Join(gt.repoPath, "mounts", filepath.Base(mountPoint)+".json")
+				os.Remove(mountFile)
+				return nil
+			}
+		}
+	}
+	
+	return fmt.Errorf("failed to unmount after retries: %w", lastErr)
+}
 
-	// Remove mount info
-	mountFile := filepath.Join(gt.repoPath, "mounts", filepath.Base(mountPoint)+".json")
-	os.Remove(mountFile)
-
-	return nil
+// killProcessesUsingMount attempts to kill processes using the mount point
+func (gt *GoTree) killProcessesUsingMount(mountPoint string) {
+	// Try fuser first (more reliable)
+	cmd := exec.Command("fuser", "-km", mountPoint)
+	cmd.Run() // Ignore errors
+	
+	// Fallback: try lsof
+	cmd = exec.Command("lsof", "-t", "+D", mountPoint)
+	output, err := cmd.Output()
+	if err == nil && len(output) > 0 {
+		pids := strings.Fields(string(output))
+		for _, pid := range pids {
+			// Send TERM first, then KILL
+			exec.Command("kill", "-TERM", pid).Run()
+		}
+		time.Sleep(100 * time.Millisecond)
+		for _, pid := range pids {
+			exec.Command("kill", "-KILL", pid).Run()
+		}
+	}
 }
 
 // Commit "pushes" changes from a mounted ref back to the image
@@ -280,6 +352,94 @@ func (gt *GoTree) DeleteMetadata(refName, key string) error {
 
 	delete(ref.Metadata, key)
 	return gt.saveRef(*ref)
+}
+
+// HasChildren returns true if any ref has this one as parent
+func (gt *GoTree) HasChildren(refName string) (bool, error) {
+	refs, err := gt.ListRefs()
+	if err != nil {
+		return false, err
+	}
+	for _, r := range refs {
+		if r.Parent == refName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// IsMountedRef checks if the ref is currently mounted anywhere
+func (gt *GoTree) IsMountedRef(refName string) (bool, error) {
+	mountsDir := filepath.Join(gt.repoPath, "mounts")
+	entries, err := os.ReadDir(mountsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(mountsDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var info map[string]string
+		if json.Unmarshal(data, &info) != nil {
+			continue
+		}
+		if info["ref"] == refName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// DeleteRef removes a ref and its layer directory (with safety checks)
+func (gt *GoTree) DeleteRef(name string, force bool) error {
+	ref, err := gt.getRef(name)
+	if err != nil {
+		return fmt.Errorf("ref not found: %w", err)
+	}
+
+	if !force {
+		hasChildren, err := gt.HasChildren(name)
+		if err != nil {
+			return err
+		}
+		if hasChildren {
+			return fmt.Errorf("cannot delete ref '%s': it has child refs", name)
+		}
+
+		isMounted, err := gt.IsMountedRef(name)
+		if err != nil {
+			return err
+		}
+		if isMounted {
+			return fmt.Errorf("cannot delete ref '%s': it is currently mounted", name)
+		}
+	}
+
+	// Delete ref metadata file
+	refPath := filepath.Join(gt.repoPath, "refs", name+".json")
+	if err := os.Remove(refPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove ref file: %w", err)
+	}
+
+	// Delete layer directory
+	layerPath := filepath.Join(gt.repoPath, "layers", ref.LayerID)
+	if err := os.RemoveAll(layerPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove layer directory: %w", err)
+	}
+
+	// Clean up work dir (best effort)
+	workPath := filepath.Join(gt.repoPath, "work", ref.LayerID)
+	_ = os.RemoveAll(workPath)
+
+	return nil
 }
 
 // Helper methods
@@ -463,13 +623,27 @@ func main() {
 
 	case "unmount":
 		if len(os.Args) < 4 {
-			fmt.Fprintf(os.Stderr, "Usage: %s <repo> unmount <mountpoint>\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "Usage: %s <repo> unmount <mountpoint> [--force]\n", os.Args[0])
 			os.Exit(1)
 		}
 		mountPoint := os.Args[3]
-
-		if err := gt.Unmount(mountPoint); err != nil {
+		force := false
+		if len(os.Args) > 4 && os.Args[4] == "--force" {
+			force = true
+		}
+		
+		var err error
+		if force {
+			err = gt.UnmountForce(mountPoint)
+		} else {
+			err = gt.Unmount(mountPoint)
+		}
+		
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error unmounting: %v\n", err)
+			if !force {
+				fmt.Fprintf(os.Stderr, "Hint: Try with --force flag to kill processes using the mount\n")
+			}
 			os.Exit(1)
 		}
 		fmt.Printf("Unmounted %s\n", mountPoint)
@@ -496,40 +670,55 @@ func main() {
 			os.Exit(1)
 		}
 		refName := os.Args[3]
-	
+
 		ref, err := gt.getRef(refName)
 		if err != nil {
 			os.Exit(1)
 		}
-	
+
 		var totalSize int64
 		current := ref
 		seen := make(map[string]bool) // basic cycle protection
-	
+
 		for {
 			if seen[current.LayerID] {
 				break
 			}
 			seen[current.LayerID] = true
-	
+
 			layerPath := filepath.Join(gt.repoPath, "layers", current.LayerID)
 			s, err := dirSize(layerPath)
 			if err == nil {
 				totalSize += s
 			}
-	
+
 			if current.Parent == "" {
 				break
 			}
-	
+
 			parentRef, err := gt.getRef(current.Parent)
 			if err != nil {
 				break
 			}
 			current = parentRef
 		}
-	
+
 		fmt.Printf("%d\n", totalSize)
+
+	case "delete", "rm":
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "Usage: %s <repo> delete <ref> [--force]\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "   or: %s <repo> rm <ref> [--force]\n", os.Args[0])
+			os.Exit(1)
+		}
+		refName := os.Args[3]
+		force := len(os.Args) >= 5 && os.Args[4] == "--force"
+
+		if err := gt.DeleteRef(refName, force); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting ref: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Deleted ref: %s\n", refName)
 
 	case "metadata":
 		if len(os.Args) < 4 {
@@ -631,6 +820,8 @@ func printUsage() {
 	fmt.Println("  gotree <repo> unmount <mountpoint>")
 	fmt.Println("  gotree <repo> commit <ref> [message]")
 	fmt.Println("  gotree <repo> size <ref>")
+	fmt.Println("  gotree <repo> delete <ref> [--force]")
+	fmt.Println("  gotree <repo> rm <ref> [--force]          (alias)")
 	fmt.Println("\nExamples:")
 	fmt.Println("  gotree /var/lib/gotree list")
 	fmt.Println("  gotree /var/lib/gotree create base")
@@ -639,4 +830,6 @@ func printUsage() {
 	fmt.Println("  gotree /var/lib/gotree unmount /mnt/dev")
 	fmt.Println("  gotree /var/lib/gotree commit dev 'Added new files'")
 	fmt.Println("  gotree /var/lib/gotree size dev")
+	fmt.Println("  gotree /var/lib/gotree delete old-experiment")
+	fmt.Println("  gotree /var/lib/gotree rm base --force")
 }
